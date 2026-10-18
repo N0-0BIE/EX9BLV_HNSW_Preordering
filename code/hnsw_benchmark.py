@@ -32,19 +32,14 @@ class KNN:
 ############################
 class HNSW_benchmark:
     def __init__(self, data, M = 16, ef_construction = 128):
-        if len(data) == 0 or len(data[0]) == 0:
-            raise ValueError("Bad dataset given. Count or dimension = 0")
-        
-        # alap adatok
-        self._data = [np.array(v) for v in data]
+        # Alap adatok
+        self._data = np.asarray([np.asarray(v) for v in data], dtype=np.float32)
         self._M = M
         self._ef_construction = ef_construction
-        # KNN init
-        self._knn = KNN(data)
         # HNSW init
-        self._hnsw = hnswlib.Index(space        = 'l2',
-                                   dim          = len(self._data[0]))
-        self._hnsw.init_index(max_elements      = len(self._data),
+        self._hnsw = hnswlib.Index(space        = 'ip',
+                                   dim          = self._data.shape[1])
+        self._hnsw.init_index(max_elements      = self._data.shape[0],
                               M                 = self._M,
                               ef_construction   = self._ef_construction)
         self._hnsw.add_items(data               = self._data)
@@ -55,60 +50,91 @@ class HNSW_benchmark:
                               ef_construction   = self._ef_construction)
         self._hnsw.add_items(data               = self._data)
 
-    def run(self, q, k = 10, ef_search = 40):
+    def calculate_knn(self, qs, k=10):
+        scores = qs @ self._data.T
+
+        topk = np.argpartition(
+            -scores,
+            kth=k-1,
+            axis=1,
+        )[:, :k]
+
+        # Optional: sort those k results by actual score
+        rows = np.arange(len(qs))[:, None]
+        order = np.argsort(-scores[rows, topk], axis=1)
+
+        knn_matrix = np.take_along_axis(topk, order, axis=1)
+        return knn_matrix # len(qs) x k nagyságú mátrix
+
+    def run(self, qs, k = 10, ef_search = 40):
+        qs = np.asarray([np.asarray(v) for v in qs], dtype=np.float32)
+
         # Várt eredmény (recall = 1) kiszámítása
-        R_E = self._knn.get_KNN(q, k)
+        R_E_list = self.calculate_knn(qs, k)
 
-        # HNSW keresési beállítások
+        # HNSW futtatása
         self._hnsw.set_ef(ef_search)
+        R_A_list, _ = self._hnsw.knn_query(qs, k=k)
 
-        # HNSW futtatása és recall számítása
-        R_A = self._hnsw.knn_query([q], k, filter=(lambda x: KNN.euclidian_distance(self._data[x], q) > 0))
-        return len(set(R_E) & set(R_A[0][0])) / k # R_E union R_A / ||R_E||
+        # Recall számítás
+        recalls = []
+        for R_A, R_E in zip(R_A_list, R_E_list):
+            recalls.append(len(set(R_A) & set(R_E)) / len(R_E)) # R_E union R_A / ||R_E||
 
-    def run_multiple(self, qs, k = 10, ef_search = 40, stats = False):
-        if stats:
-            start = time()
-        recalls = [self.run(q, k=k, ef_search=ef_search) for q in qs]
-        if stats:
-            elapsed = time() - start
-            start = time()
-            print(f"Minimum recall: {np.min(recalls):.4f}")
-            print(f"Average recall: {np.mean(recalls):.4f}")
-            print(f"Maximum recall: {np.max(recalls):.4f}")
-            print(f"Total time: {elapsed:.3f} seconds")
-            print(f"Average time per query: {elapsed / len(qs) * 1000:.3f} ms")
         return recalls
 
 
 ############################
 ###         LID          ###
 ############################
+def euclidian_distance(x, y):
+    if len(x) != len(y):
+        raise ValueError("Dimensions not matching!")
+
+    sum = 0
+    for i in range(0, len(x)):
+        sum += (y[i] - x[i]) ** 2
+    return np.sqrt(sum)
+
 # LID@k értékek meghatározása az adathalmazban minden pontra
 def calculate_lid(data, k=100):
-    vectors = np.asarray(list(data), dtype=np.float32)
-    n = len(vectors)
+    # KNN számítás minden pontra
+    data = np.asarray([np.asarray(v) for v in data], dtype=np.float32)
+    scores = data @ data.T
 
-    if n <= k:
-        raise ValueError(f"Dataset must contain more than k={k} vectors.")
+    # Assign the same ID to identical vectors, then exclude them from each row.
+    _, vector_ids = np.unique(data, axis=0, return_inverse=True)
+    for row, vector_id in enumerate(vector_ids):
+        scores[row, vector_ids == vector_id] = -np.inf
 
-    knn = KNN(vectors)
-    lid_values = np.full(n, np.nan, dtype=np.float64)
+    topk = np.argpartition(
+        -scores,
+        kth=k-1,
+        axis=1,
+    )[:, :k]
+
+    # Optional: sort those k results by actual score
+    rows = np.arange(len(data))[:, None]
+    order = np.argsort(-scores[rows, topk], axis=1)
+
+    knn_matrix = np.take_along_axis(topk, order, axis=1)
 
     # LID számítása egyes vektorokra
-    for i, vector in enumerate(vectors):
-        # KNN számítás
-        neighbor_indices = knn.get_KNN(vector, k)
+    lid_values = np.full(len(data), np.nan, dtype=np.float64)
+
+    for i, neighbor_indices in enumerate(knn_matrix):
         #Távolságok számítása
-        distances = np.array([KNN.euclidian_distance(vector, vectors[j]) for j in neighbor_indices])
+        distances = np.array([euclidian_distance(data[i], data[j]) for j in neighbor_indices])
 
         distances = distances[distances > 0]
 
         if len(distances) < k:
             print(f"Point: {i}")
+            print(knn_matrix[i][:10])
             print(neighbor_indices[:10])
             raise ValueError(f"Some elements deleted.")
 
+        # LID érték kiszámítása
         r_k = distances[-1]
         sum_log = np.sum(np.log2(distances / r_k)) # ln lenne helyes, de mindegy a rangsorolás szempontjából, mivel mindegyik log fv. szig. mon. növ.
         lid_values[i] = -((sum_log / k) ** -1)
